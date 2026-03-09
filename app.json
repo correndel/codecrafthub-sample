@@ -1,0 +1,374 @@
+// app.js
+// CodeCraftHub: Complete REST API for courses with JSON file storage
+// Supports both path-based and body-based (alternate) endpoints as requested.
+
+const express = require('express');
+const fs = require('fs').promises;
+const path = require('path');
+
+// Initialize Express app
+const app = express();
+app.use(express.json()); // Parse JSON bodies
+
+// Configuration
+const DATA_FILE = path.join(__dirname, 'courses.json'); // JSON file storage
+const ALLOWED_STATUS = ['Not Started', 'In Progress', 'Completed'];
+const PORT = process.env.PORT || 5000;
+
+// 1) Ensure the data file exists (creates with [] if missing)
+async function ensureDataFile() {
+  try {
+    await fs.access(DATA_FILE);
+  } catch (err) {
+    // Create directory/file if missing
+    await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
+    await fs.writeFile(DATA_FILE, '[]', 'utf8');
+  }
+}
+
+// 2) Read all courses
+async function readCourses() {
+  await ensureDataFile();
+  const data = await fs.readFile(DATA_FILE, 'utf8');
+  try {
+    const courses = JSON.parse(data);
+    if (!Array.isArray(courses)) throw new Error('Invalid data format');
+    return courses;
+  } catch (err) {
+    // If malformed, reset to empty array
+    await fs.writeFile(DATA_FILE, '[]', 'utf8');
+    return [];
+  }
+}
+
+// 3) Write all courses
+async function writeCourses(courses) {
+  await ensureDataFile();
+  await fs.writeFile(DATA_FILE, JSON.stringify(courses, null, 2), 'utf8');
+}
+
+// 4) Get next auto-incrementing ID (starts from 1)
+async function getNextId() {
+  const courses = await readCourses();
+  const maxId = courses.reduce((max, c) => Math.max(max, c.id || 0), 0);
+  return maxId + 1;
+}
+
+// 5) Validate target_date format YYYY-MM-DD and actual date
+function isValidDateString(dateStr) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return false;
+  // Ensure it's a real date
+  const dt = Date.parse(dateStr);
+  if (Number.isNaN(dt)) return false;
+  // Sanity check: reconstruct and compare
+  const [year, month, day] = dateStr.split('-').map(Number);
+  const d = new Date(year, month - 1, day);
+  return (
+    d.getFullYear() === year &&
+    d.getMonth() + 1 === month &&
+    d.getDate() === day
+  );
+}
+
+// 6) Start building routes
+// Base path: /api/courses
+
+// GET /api/courses
+// - If query ?id= is provided, return that specific course
+// - If no id provided, return all courses
+app.get('/api/courses', async (req, res) => {
+  try {
+    const { id } = req.query;
+    const courses = await readCourses();
+
+    if (id !== undefined) {
+      const numeric = parseInt(id, 10);
+      if (Number.isNaN(numeric)) {
+        return res.status(400).json({ error: 'Invalid id' });
+      }
+      const course = courses.find((c) => c.id === numeric);
+      if (!course) return res.status(404).json({ error: 'Course not found' });
+      return res.json(course);
+    }
+
+    res.json(courses);
+  } catch (err) {
+    console.error('Error reading courses:', err);
+    res.status(500).json({ error: 'Failed to read courses' });
+  }
+});
+
+// GET /api/courses/:id - Get by path param
+app.get('/api/courses/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  try {
+    const courses = await readCourses();
+    const course = courses.find((c) => c.id === id);
+    if (!course) return res.status(404).json({ error: 'Course not found' });
+    res.json(course);
+  } catch (err) {
+    console.error('Error fetching course:', err);
+    res.status(500).json({ error: 'Failed to read course' });
+  }
+});
+
+// POST /api/courses - Create a new course
+app.post('/api/courses', async (req, res) => {
+  const { name, description, target_date, status } = req.body;
+
+  // Required fields check
+  if (!name || !description || !target_date || !status) {
+    return res
+      .status(400)
+      .json({
+        error:
+          'Missing required fields: name, description, target_date, status',
+      });
+  }
+
+  // Status validation
+  if (!ALLOWED_STATUS.includes(status)) {
+    return res
+      .status(400)
+      .json({
+        error: `Invalid status. Allowed values: ${ALLOWED_STATUS.join(', ')}`,
+      });
+  }
+
+  // Date validation
+  if (!isValidDateString(target_date)) {
+    return res
+      .status(400)
+      .json({ error: 'Invalid target_date. Format must be YYYY-MM-DD' });
+  }
+
+  try {
+    const id = await getNextId();
+    const created_at = new Date().toISOString();
+    const newCourse = {
+      id,
+      name,
+      description,
+      target_date,
+      status,
+      created_at,
+    };
+
+    const courses = await readCourses();
+    courses.push(newCourse);
+    await writeCourses(courses);
+
+    res.status(201).json(newCourse);
+  } catch (err) {
+    console.error('Error creating course:', err);
+    res.status(500).json({ error: 'Failed to create course' });
+  }
+});
+
+// PUT /api/courses - Update a course by passing id in body
+app.put('/api/courses', async (req, res) => {
+  const { id, name, description, target_date, status } = req.body;
+
+  // id is required for this alternate endpoint
+  if (typeof id !== 'number') {
+    return res
+      .status(400)
+      .json({ error: 'Missing or invalid id in request body' });
+  }
+
+  // All fields required for full update
+  if (!name || !description || !target_date || !status) {
+    return res
+      .status(400)
+      .json({
+        error:
+          'Missing required fields: name, description, target_date, status',
+      });
+  }
+
+  if (!ALLOWED_STATUS.includes(status)) {
+    return res
+      .status(400)
+      .json({
+        error: `Invalid status. Allowed values: ${ALLOWED_STATUS.join(', ')}`,
+      });
+  }
+
+  if (!isValidDateString(target_date)) {
+    return res
+      .status(400)
+      .json({ error: 'Invalid target_date. Format must be YYYY-MM-DD' });
+  }
+
+  try {
+    const courses = await readCourses();
+    const idx = courses.findIndex((c) => c.id === id);
+    if (idx === -1) return res.status(404).json({ error: 'Course not found' });
+
+    const created_at = courses[idx].created_at; // preserve original created_at
+    const updated = { id, name, description, target_date, status, created_at };
+    courses[idx] = updated;
+
+    await writeCourses(courses);
+    res.json(updated);
+  } catch (err) {
+    console.error('Error updating course:', err);
+    res.status(500).json({ error: 'Failed to update course' });
+  }
+});
+
+// PUT /api/courses/:id - Update a specific course by path parameter
+app.put('/api/courses/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  const { name, description, target_date, status } = req.body;
+
+  if (!name || !description || !target_date || !status) {
+    return res
+      .status(400)
+      .json({
+        error:
+          'Missing required fields: name, description, target_date, status',
+      });
+  }
+  if (!ALLOWED_STATUS.includes(status)) {
+    return res
+      .status(400)
+      .json({
+        error: `Invalid status. Allowed values: ${ALLOWED_STATUS.join(', ')}`,
+      });
+  }
+  if (!isValidDateString(target_date)) {
+    return res
+      .status(400)
+      .json({ error: 'Invalid target_date. Format must be YYYY-MM-DD' });
+  }
+
+  try {
+    const courses = await readCourses();
+    const idx = courses.findIndex((c) => c.id === id);
+    if (idx === -1) return res.status(404).json({ error: 'Course not found' });
+
+    const created_at = courses[idx].created_at;
+    courses[idx] = { id, name, description, target_date, status, created_at };
+
+    await writeCourses(courses);
+    res.json(courses[idx]);
+  } catch (err) {
+    console.error('Error updating course:', err);
+    res.status(500).json({ error: 'Failed to update course' });
+  }
+});
+
+// PATCH /api/courses/:id - Partially update a course by path parameter
+app.patch('/api/courses/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  const updates = req.body;
+  if (!updates || Object.keys(updates).length === 0) {
+    return res.status(400).json({ error: 'No fields provided for update' });
+  }
+
+  const allowedKeys = ['name', 'description', 'target_date', 'status'];
+
+  try {
+    const courses = await readCourses();
+    const idx = courses.findIndex((c) => c.id === id);
+    if (idx === -1) return res.status(404).json({ error: 'Course not found' });
+
+    const current = { ...courses[idx] };
+
+    for (const key of Object.keys(updates)) {
+      if (!allowedKeys.includes(key)) continue;
+
+      if (key === 'target_date') {
+        if (!isValidDateString(updates[key])) {
+          return res
+            .status(400)
+            .json({ error: 'Invalid target_date. Format must be YYYY-MM-DD' });
+        }
+        current.target_date = updates[key];
+      } else if (key === 'status') {
+        if (!ALLOWED_STATUS.includes(updates[key])) {
+          return res
+            .status(400)
+            .json({
+              error: `Invalid status. Allowed values: ${ALLOWED_STATUS.join(
+                ', '
+              )}`,
+            });
+        }
+        current.status = updates[key];
+      } else {
+        current[key] = updates[key];
+      }
+    }
+
+    // Do not modify created_at on patch
+    courses[idx] = current;
+    await writeCourses(courses);
+
+    res.json(current);
+  } catch (err) {
+    console.error('Error patching course:', err);
+    res.status(500).json({ error: 'Failed to patch course' });
+  }
+});
+
+// DELETE /api/courses/:id - Delete a course by path parameter
+app.delete('/api/courses/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  try {
+    const courses = await readCourses();
+    const idx = courses.findIndex((c) => c.id === id);
+    if (idx === -1) return res.status(404).json({ error: 'Course not found' });
+
+    const [removed] = courses.splice(idx, 1);
+    await writeCourses(courses);
+    res.json(removed);
+  } catch (err) {
+    console.error('Error deleting course:', err);
+    res.status(500).json({ error: 'Failed to delete course' });
+  }
+});
+
+// DELETE /api/courses - Delete a course by id in request body
+app.delete('/api/courses', async (req, res) => {
+  const { id } = req.body;
+  if (typeof id !== 'number') {
+    return res
+      .status(400)
+      .json({ error: 'Missing or invalid id in request body' });
+  }
+
+  try {
+    const courses = await readCourses();
+    const idx = courses.findIndex((c) => c.id === id);
+    if (idx === -1) return res.status(404).json({ error: 'Course not found' });
+
+    const [removed] = courses.splice(idx, 1);
+    await writeCourses(courses);
+    res.json(removed);
+  } catch (err) {
+    console.error('Error deleting course:', err);
+    res.status(500).json({ error: 'Failed to delete course' });
+  }
+});
+
+// 7) Start the server
+ensureDataFile()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`CodeCraftHub API listening on http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialize data file:', err);
+    process.exit(1);
+  });
